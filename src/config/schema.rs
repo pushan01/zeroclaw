@@ -4427,6 +4427,7 @@ pub struct ChannelsConfig {
     pub wati: Option<WatiConfig>,
     /// Nextcloud Talk bot channel configuration.
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
+    pub synobotchat: Option<SynoBotChatConfig>,
     /// Email channel configuration.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     /// IRC channel configuration.
@@ -4519,6 +4520,10 @@ impl ChannelsConfig {
                 self.nextcloud_talk.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.synobotchat.as_ref())),
+                self.synobotchat.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.email.as_ref())),
                 self.email.is_some(),
             ),
@@ -4596,6 +4601,7 @@ impl Default for ChannelsConfig {
             bluebubbles: None,
             wati: None,
             nextcloud_talk: None,
+            synobotchat: None,
             email: None,
             irc: None,
             lark: None,
@@ -5415,6 +5421,23 @@ impl ChannelConfig for NextcloudTalkConfig {
     }
     fn desc() -> &'static str {
         "NextCloud Talk platform"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SynoBotChatConfig {
+    pub base_url: String,
+    pub token: String,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+}
+
+impl ChannelConfig for SynoBotChatConfig {
+    fn name() -> &'static str {
+        "SynoBotChat"
+    }
+    fn desc() -> &'static str {
+        "Synology Chat bot"
     }
 }
 
@@ -10105,6 +10128,7 @@ ws_url = "ws://127.0.0.1:3002"
                 qq: None,
                 nostr: None,
                 clawdtalk: None,
+                synobotchat: None,
                 ack_reaction: AckReactionChannelsConfig::default(),
                 message_timeout_secs: 300,
             },
@@ -11072,6 +11096,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             nostr: None,
             clawdtalk: None,
+            synobotchat: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: 300,
         };
@@ -11419,6 +11444,7 @@ channel_id = "C123"
             qq: None,
             nostr: None,
             clawdtalk: None,
+            synobotchat: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: 300,
         };

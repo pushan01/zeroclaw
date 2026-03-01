@@ -16,7 +16,7 @@ pub mod ws;
 
 use crate::channels::{
     BlueBubblesChannel, Channel, GitHubChannel, LinqChannel, NextcloudTalkChannel, QQChannel,
-    SendMessage, WatiChannel, WhatsAppChannel,
+    SendMessage, SynoBotChatChannel, WatiChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
@@ -101,11 +101,41 @@ fn gateway_message_session_id(msg: &crate::channels::traits::ChannelMessage) -> 
     }
 }
 
+fn synobotchat_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("synobotchat_{}_{}", msg.sender, msg.id)
+}
+
 fn hash_webhook_secret(value: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(value.as_bytes());
     hex::encode(digest)
+}
+
+fn decode_form_component(value: &str) -> String {
+    let normalized = value.replace('+', " ");
+    urlencoding::decode(&normalized)
+        .map(|v| v.into_owned())
+        .unwrap_or(normalized)
+}
+
+fn parse_form_body(body: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for pair in body.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut iter = pair.splitn(2, '=');
+        let key = iter.next().unwrap_or("");
+        if key.is_empty() {
+            continue;
+        }
+        let value = iter.next().unwrap_or("");
+        let key = decode_form_component(key);
+        let value = decode_form_component(value);
+        map.insert(key, value);
+    }
+    map
 }
 
 /// How often the rate limiter sweeps stale IP entries from its map.
@@ -357,6 +387,7 @@ pub struct AppState {
     pub wati: Option<Arc<WatiChannel>>,
     /// WATI webhook secret for signature/bearer verification
     pub wati_webhook_secret: Option<Arc<str>>,
+    pub synobotchat: Option<Arc<SynoBotChatChannel>>,
     pub qq: Option<Arc<QQChannel>>,
     pub qq_webhook_enabled: bool,
     /// Observability backend for metrics scraping
@@ -625,6 +656,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             ))
         });
 
+    let synobotchat_channel: Option<Arc<SynoBotChatChannel>> =
+        config.channels_config.synobotchat.as_ref().map(|syno| {
+            Arc::new(SynoBotChatChannel::new(
+                syno.base_url.clone(),
+                syno.token.clone(),
+                syno.allowed_user_ids.clone(),
+            ))
+        });
+
     // Nextcloud Talk webhook secret for signature verification
     // Priority: environment variable > config file
     let nextcloud_talk_webhook_secret: Option<Arc<str>> =
@@ -718,6 +758,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if nextcloud_talk_channel.is_some() {
         println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
     }
+    if synobotchat_channel.is_some() {
+        println!("  POST /synobotchat — SynoBotChat webhook");
+    }
     if qq_webhook_enabled {
         println!("  POST /qq        — QQ Bot webhook (validation + events)");
     }
@@ -786,6 +829,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
         wati_webhook_secret,
+        synobotchat: synobotchat_channel,
         qq: qq_channel,
         qq_webhook_enabled,
         observer: broadcast_observer,
@@ -834,6 +878,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        .route("/synobotchat", post(handle_synobotchat_webhook))
         .route("/qq", post(handle_qq_webhook))
         // ── OpenClaw migration: tools-enabled chat endpoint ──
         .route("/api/chat", post(openclaw_compat::handle_api_chat))
@@ -2763,6 +2808,97 @@ async fn handle_nextcloud_talk_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+async fn handle_synobotchat_webhook(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref syno) = state.synobotchat else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "SynoBotChat not configured"})),
+        );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+    let mut form = parse_form_body(&body_str);
+    for (key, value) in query {
+        form.entry(key).or_insert(value);
+    }
+
+    let token = form.get("token").map(|v| v.trim()).unwrap_or("");
+    if token.is_empty() || !constant_time_eq(token, syno.token()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid token"})),
+        );
+    }
+
+    let messages = syno.parse_webhook_form(&form);
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    let state_clone = state.clone();
+    let syno_clone = syno.clone();
+    // synobotchat's webhook timeout is 10 seconds, we need to process messages in a separate task
+    tokio::spawn(async move {
+        process_synobotchat_messages(state_clone, syno_clone, messages).await;
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn process_synobotchat_messages(
+    state: AppState,
+    syno: Arc<SynoBotChatChannel>,
+    messages: Vec<crate::channels::traits::ChannelMessage>,
+) {
+    for msg in &messages {
+        tracing::info!(
+            "SynoBotChat message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        let session_id = gateway_message_session_id(msg);
+
+        if state.auto_save {
+            let key = synobotchat_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, Some(&session_id))
+                .await;
+        }
+
+        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+            Ok(response) => {
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
+                if let Err(e) = syno
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send SynoBotChat reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for SynoBotChat message: {e:#}");
+                let _ = syno
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+}
+
 /// POST /qq — incoming QQ Bot webhook (validation + events)
 async fn handle_qq_webhook(
     State(state): State<AppState>,
@@ -2982,6 +3118,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3044,6 +3181,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer,
@@ -3089,6 +3227,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3135,6 +3274,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3650,6 +3790,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3724,6 +3865,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3779,6 +3921,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3835,6 +3978,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3900,6 +4044,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3958,6 +4103,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4022,6 +4168,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4080,6 +4227,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4168,6 +4316,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4226,6 +4375,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4289,6 +4439,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4396,6 +4547,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4448,6 +4600,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: Some(wati),
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4502,6 +4655,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: Some(wati),
             wati_webhook_secret: Some(Arc::from(secret.as_str())),
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4557,6 +4711,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: Some(wati),
             wati_webhook_secret: Some(Arc::from(secret.as_str())),
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4619,6 +4774,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: Some(wati),
             wati_webhook_secret: Some(Arc::from(secret.as_str())),
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4679,6 +4835,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: Some(wati),
             wati_webhook_secret: Some(Arc::from(secret.as_str())),
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4740,6 +4897,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: Some(wati),
             wati_webhook_secret: Some(Arc::from(secret.as_str())),
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4801,6 +4959,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: Some(wati),
             wati_webhook_secret: Some(Arc::from(secret.as_str())),
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4864,6 +5023,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: Some(wati),
             wati_webhook_secret: Some(Arc::from(secret.as_str())),
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4919,6 +5079,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -4975,6 +5136,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -5042,6 +5204,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -5114,6 +5277,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -5176,6 +5340,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -5231,6 +5396,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -5285,6 +5451,7 @@ Reminder set successfully."#;
             nextcloud_talk_webhook_secret: None,
             wati: None,
             wati_webhook_secret: None,
+            synobotchat: None,
             qq: Some(qq),
             qq_webhook_enabled: true,
             observer: Arc::new(crate::observability::NoopObserver),
